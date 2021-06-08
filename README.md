@@ -6,6 +6,8 @@
  * Calculates with Makkink formula the net evaporation (evaporation - rain - watering)
  * Maintains database of amount of watering done
  * Steers relay boards on Raspberry Pi to open and close valves
+ * Supports multiple water sources (barrel, drinking water)
+ * SUpports multiple irrigation zones with area (m2), shadow (%), flow requirements (drip or sprinkler system)
  * Measures the flow rate to calculate liters of watering
  * Writes the amount of millimeter watered in database
 
