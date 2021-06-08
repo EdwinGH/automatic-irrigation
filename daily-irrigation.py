@@ -15,6 +15,13 @@
 # Release 2021-04-17 Updated for actual working on Raspberry Pi (relay PINs, Keyboard interrupts)
 # Release 2021-04-21 Forked for fixed watering during X minuten
 # Release 2021-04-22 Adding more structures with classes and files
+# Release 2021-04-29 Changed Zone no_barrel to required water pressure (minimal flow)
+#
+# TODO
+# - Issue with flow vs pressure: Sprinklers generate flow of only ~2, but pressure is good...
+# - Store irrigation per zone, and calculate required irrigation per zone
+# - Log to e-mail?
+# - Fix multiple zone logging on command line (split the command line and find splitted in list)
 #
 # Author E Zuidema
 #
@@ -31,7 +38,7 @@
 #
 
 progname='Sprinkler.py'
-version = "2021-04-22"
+version = "2021-04-29"
 
 import sys
 import logging
@@ -67,7 +74,6 @@ flow_grass_PIN = 7
 flow_front_PIN = 11
 flow_sprinkler_PIN = 16
 
-
 def parse_arguments(logger):
   ################################################################################################################################################
   #Commandline arguments parsing
@@ -78,7 +84,6 @@ def parse_arguments(logger):
   parser.add_argument("-d", "--days", help="How many days to look back, default 35 (exclusive with amount)", default='35')
   parser.add_argument("-a", "--amount", help="How many liters per m2 to irrigate (exclusive with days)", default = '0')
   parser.add_argument("-z", "--zones", help="Zone(s) to irrigate, can be 'grass', 'sprinkler', 'front' or multiple. Default is all", default='all', nargs='*')
-  parser.add_argument("-b", "--use-barrel", help="Use the Barrel, alternative is use drinking water", default=False, action="store_true")
   parser.add_argument("-e", "--emulate", help="Do not actually open/close valves or store data", default=False, action="store_true")
   parser.add_argument("-s", "--server", help="MySQL server or socket path, default='localhost'", default='localhost')
   parser.add_argument("-u", "--user", help="MySQL user, default='root'", default='root')
@@ -95,12 +100,17 @@ def parse_arguments(logger):
   else:
     logging.basicConfig(filename=args.logfile,format='%(asctime)s - %(levelname)s - %(lineno)d - %(message)s')
 
+  # Setting loop duration; default 60s
+  loop_seconds = 60
+
   if (args.log == 'debug'):
     logger.setLevel(logging.DEBUG)
+    loop_seconds = 10
   if (args.log == 'warning'):
     logger.setLevel(logging.WARNING)
   if (args.log == 'info'):
     logger.setLevel(logging.INFO)
+    loop_seconds = 30
   if (args.log == 'error'):
     logger.setLevel(logging.ERROR)
 
@@ -113,12 +123,6 @@ def parse_arguments(logger):
     days = int(args.days)
     logger.info("Looking back: %d days", days)
     amount = 0
-
-  if args.use_barrel:
-    use_barrel = True
-    logger.debug("using Barrel")
-  else:
-    use_barrel = False
 
   if args.emulate:
     emulating = True
@@ -137,7 +141,7 @@ def parse_arguments(logger):
   logger.debug("MySQL Password: %s", mysql_passwd)
 
   # return parsed values
-  return (days, amount, zones, use_barrel, emulating, mysql_host, mysql_user, mysql_passwd)
+  return (loop_seconds, days, amount, zones, emulating, mysql_host, mysql_user, mysql_passwd)
 
 def load_evaporation( logger, \
                       days, \
@@ -316,21 +320,20 @@ class WaterSource():
   def get_name(self):
     return self.name
 
-  def barrel(self):
-    return "barrel" in self.name.lower()
-
   def open_valve(self):
     self.logger.info("Setting %s water ON", self.name)
+    # Note: Takes 10-15 seconds to fully open
     GPIO.output(self.relay_pin, GPIO.HIGH)
 
   def close_valve(self):
     self.logger.info("Setting %s water OFF", self.name)
+    # Note: Takes 10-15 seconds to fully close
     GPIO.output(self.relay_pin, GPIO.LOW)
 
 
 class IrrigationZone():
   
-  def __init__(self, logger, name, relay_bus, relay_pin, area, flow_pin, use_barrel = True):
+  def __init__(self, logger, name, relay_bus, relay_pin, area, flow_pin, flow_required = -1):
     self.logger = logger
     self.logger.debug("IrrigationZone init for %s", name)
     self.name = name
@@ -339,16 +342,13 @@ class IrrigationZone():
     self.relay_bus = relay_bus
     self.relay_pin = relay_pin
     self.flow_pin = flow_pin
-    self.use_barrel = use_barrel
+    self.flow_required = flow_required
 
     # Start a flowmeter associated with this zone
     self.flow_meter = FlowMeter(self.logger, self.name + " (PIN " + str(flow_pin) + ")")
 
   def get_name(self):
     return self.name
-
-  def no_barrel(self):
-    return not self.use_barrel
     
   def get_area(self):
     return self.area
@@ -376,6 +376,10 @@ class IrrigationZone():
     self.logger.debug("%s: get_flow_rate:", self.name)
     return self.flow_meter.getFlowRate()
 
+  def get_flow_required(self):
+    self.logger.debug("%s: get_flow_required:", self.name)
+    return self.flow_required
+
   def get_irrigated_liters(self):
     return self.irrigated_liters
 
@@ -391,32 +395,32 @@ class FlowMeter():
     self.logger = logger
     self.logger.debug("Flow init for %s, setting last_time to now, and rate to 0", name)
     self.name = name
-    self.flow_rate = 0.0
+    self.average_flow_rate = 0.0
+    self.last_flow_rates = numpy.array([])
+    self.last_flow_rate = 0.0
     self.last_time = datetime.now()
 
   def pulseCallback(self, p):
     ''' Callback that is executed with each pulse
         received from the sensor
     '''
-
     self.logger.debug("%s: pulseCallback: Flowing!", self.name)
     # Calculate the time difference since last pulse received
     current_time = datetime.now()
     diff = (current_time - self.last_time).total_seconds()
-
     if(diff < 2):
       # Calculate current flow rate
       hertz = 1.0 / diff
-      self.flow_rate = hertz / 7.5
-      self.logger.debug("pC Rate: %.1f (diff %.3f s)" % (self.flow_rate, diff))
+      self.last_flow_rate = hertz / 7.5
+      self.last_flow_rates = numpy.append(self.last_flow_rates, self.last_flow_rate)
+      self.logger.debug("pC Rate: %.1f (diff %.3f s)" % (self.last_flow_rate, diff))
     else:
       # Took too long, setting rates to 0
       self.flow_rate = 0.0
       self.logger.debug("pC Took too long (%.0f s), setting flow rate to 0" % diff)
-
     # Reset time of last pulse
     self.last_time = current_time
-    self.logger.debug("pC last_time = %s" % self.last_time)
+    self.logger.debug("pC last_time = %s, array size %d" % (self.last_time, numpy.size(self.last_flow_rates)))
 
   def getFlowRate(self):
     ''' Return the current flow rate measurement.
@@ -425,21 +429,19 @@ class FlowMeter():
     '''
 
     self.logger.debug("%s: getFlowRate:", self.name)
-    current_time = datetime.now()
-    self.logger.debug("gF current_time = %s, last_time = %s" % (current_time, self.last_time))
-    diff = (current_time - self.last_time).total_seconds()
-    if (diff >= 2):
-#      self.logger.debug("gF Took too long (%.0f s), setting flowrate to 0" % diff)
-#      self.flow_rate = 0.0
-      self.logger.debug("gF Took too long (%.0f s), setting flowrate to 0.1" % diff)
-      self.flow_rate = 0.1
-    if (diff < 0.01):
-      self.logger.debug("gF Took too short (%f s), not updating flowrate..." % diff)
-#      self.logger.debug("gF Took too short (%f s), setting flowrate to 10" % diff)
-#      self.flow_rate = 10.0
 
-    self.logger.debug("Returning flow rate of %.1f (diff %.3f s)" % (self.flow_rate, diff))
-    return self.flow_rate
+    self.logger.debug("Last flow rate %.1f" % self.last_flow_rate)
+    # Calculate average since last call
+    stored_values = numpy.size(self.last_flow_rates)
+    if (stored_values > 0):
+      self.average_flow_rate = numpy.average(self.last_flow_rates)
+    else:
+      self.average_flow_rate = 0.0
+    self.logger.debug("Average flow rate %.1f (from %d values)" % (self.average_flow_rate, stored_values))
+    # Re-initialize the array
+    self.last_flow_rates = numpy.array([])
+
+    return self.average_flow_rate
 
 # Main
 def main():
@@ -452,7 +454,7 @@ def main():
 
   logger = logging.getLogger(progname)
 
-  (days, amount, zones_to_water, use_barrel, emulating, mysql_host, mysql_user, mysql_passwd) = parse_arguments(logger)
+  (loop_seconds, days, amount, zones_to_water, emulating, mysql_host, mysql_user, mysql_passwd) = parse_arguments(logger)
   logger.info("Started program %s, version %s", progname, version)
 
   host_name = socket.gethostname()
@@ -521,10 +523,10 @@ def main():
 
   # Init zones
   zones = []
-  zones.append(IrrigationZone(logger, "Grass (sweat)", bus, valve_grass, 10 * 8, flow_grass_PIN))
-  zones.append(IrrigationZone(logger, "Front (drip)", bus, valve_front, 12 * 4 + 8 * 4, flow_front_PIN))
-  # For sprinkler do not use barrel (hence the False at the end)
-  zones.append(IrrigationZone(logger, "Side (sprinkler)", bus, valve_sprinkler, 10 * 4, flow_sprinkler_PIN, False))
+  zones.append(IrrigationZone(logger, "Grass (sweat)", bus, valve_grass, 10 * 8, flow_grass_PIN, 0.5))
+  zones.append(IrrigationZone(logger, "Front (drip)", bus, valve_front, 12 * 4 + 8 * 4, flow_front_PIN, 0.5))
+  # For sprinklers require high flow rate, like 3 l/m
+  zones.append(IrrigationZone(logger, "Side (sprinkler)", bus, valve_sprinkler, 10 * 4, flow_sprinkler_PIN, 2.0))
 
   # Start irrigation
   # start with first water source (most durable)
@@ -542,16 +544,6 @@ def main():
           break
       if (skip): continue # next zone in zones
 
-    # Make sure we use the right source for the zone
-    if (zone.no_barrel() and source.barrel()):
-      # Zone requires non-barrel source (e.g. due to water pressure needed)
-      if (source_index < len(sources)-1):
-        source_index += 1
-      else:
-        # Last item in list, move to beginning
-        source_index = 0
-      source = sources[source_index]
-
     # Calculate liters for this zone area
     liters = zone.get_area() * liters_per_m2
     logger.info("Starting zone %s with source %s:", zone.get_name(), source.get_name())
@@ -565,22 +557,24 @@ def main():
       # Open source valve
       source.open_valve()      
 
-    # Measure flow and wait till finished (net_evap or amount)
+    # Initialize timing
     start_time = datetime.now()
     actual_liters = 0.0
 
-    # Get current timestamp and first flow meter reading
+    # Wait for some flow to start, get current timestamp and first flow meter reading
+    sleep(5)
     flow_rate = zone.get_flow_rate()
     logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate)
     # If flowrate is still zero, use 1 liter per minute to initiate
     duration = liters / max(flow_rate, 1) * 60
     logger.info("Stopping in about %d seconds", duration)
     previous_time = start_time
+    previous_flow_rate = flow_rate
 
     while duration > 0:
       try:
-        # Monitor every 10 seconds
-        sleep(min(10, duration))
+        # Monitor every 60 seconds, or remaining duration if smaller
+        sleep(min(loop_seconds, duration))
       except KeyboardInterrupt:
         # Close the valves and exit program
         logger.info("Interrupted; closing valves and exiting...")
@@ -589,16 +583,52 @@ def main():
           source.close_valve()
           GPIO.cleanup()
         exit(-1)
-      # Check current flow and remaining time
+
+      # Check flow and time
       current_time = datetime.now()
       current_seconds = (current_time - previous_time).total_seconds()
       flow_rate = zone.get_flow_rate()
       logger.debug("Flow rate: %.0f liter(s) per minute, during %d seconds", flow_rate, current_seconds)
-      actual_liters += current_seconds / 60 * flow_rate
-      duration = (liters - actual_liters) / flow_rate * 60 
+
+      # See if source flow rate complies to requirement for zone
+      if (flow_rate < zone.get_flow_required() and previous_flow_rate < zone.get_flow_required()):
+        # Flow rate too low, switch to next source
+        logger.info("Switching to next source, as flow rate too low (%.1f then %.1f, where %.1f required)", previous_flow_rate, flow_rate, zone.get_flow_required())
+        if (not emulating):
+          # Close source valve, make sure it is fully closed before switching to next source
+          source.close_valve()
+          sleep(15)
+        if (source_index < len(sources)-1):
+          # Next source
+          source_index += 1
+        else:
+          # Last item in list, stop with error
+          logger.info("No more sources, closing valves and exiting...")
+          if (not emulating):
+            zone.close_valve()
+            GPIO.cleanup()
+          exit(-1)
+        # Continue with next source
+        source = sources[source_index]
+        if (not emulating):
+          # Open source valve
+          source.open_valve()
+        # Wait for some flow to start, get current timestamp and first flow meter reading
+        sleep(5)
+        flow_rate = zone.get_flow_rate()
+        logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate)
+        # If flowrate is still zero, use 1 liter per minute to initiate
+        duration = (liters - actual_liters) / max(flow_rate, 1) * 60
+        logger.info("Stopping in about %d seconds", duration)
+      else: # Flow rate is fine, no switching
+        # Calculate remaining duration 
+        actual_liters += current_seconds / 60 * flow_rate
+        duration = (liters - actual_liters) / max(flow_rate, 1) * 60 
+
       if duration > 0:
         logger.info("Watered %.0f liters from %s, %.0f liters remaining (ready in about %d seconds)", actual_liters, source.get_name(), liters - actual_liters, duration)
         previous_time = current_time
+        previous_flow_rate = flow_rate
       else:
         logger.info("Ended zone %s having watered %.1f liters", zone.get_name(), actual_liters)
 
@@ -624,7 +654,7 @@ def main():
 
   # Store irrigation in database
   if (not emulating):
-    save_irrigated(logger, mysql_host, mysql_user, mysql_passwd, actual_liters_per_m2)
+    save_irrigated(logger, mysql_host, mysql_user, mysql_passwd, float(actual_liters_per_m2))
     # Clean GPIO settings
     GPIO.cleanup()
   
