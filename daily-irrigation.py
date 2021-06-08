@@ -12,6 +12,9 @@
 # Release 2021-04-08 Fixed stability for NULL entries in database (happens if temporarily disconnected from weather station)
 # Release 2021-04-11 Updated driving the sprinkler system with new motorized ball valves instead of solenoid valves
 #                    Added front garden watering, optimized per minute flow measurement
+# Release 2021-04-17 Updated for actual working on Raspberry Pi (relay PINs, Keyboard interrupts)
+# Release 2021-04-21 Forked for fixed watering during X minuten
+# Release 2021-04-22 Adding more structures with classes and files
 #
 # Author E Zuidema
 #
@@ -28,690 +31,604 @@
 #
 
 progname='Sprinkler.py'
-version = "2021-04-11"
+version = "2021-04-22"
 
 import sys
 import logging
 import argparse
 import time
 from time import sleep
+from datetime import datetime
 import mysql.connector
 import numpy
 import math
 import socket
 
-################################################################################################################################################
-#Main program
-################################################################################################################################################
-print("%s (version %s)" % (progname, version))
-#print("Python version %s.%s.%s" % sys.version_info[:3])
-#print("Control-C to abort")
+import RPi.GPIO as GPIO
+import smbus
 
-################################################################################################################################################
-#Commandline arguments parsing
-################################################################################################################################################    
-parser = argparse.ArgumentParser(prog=progname, description='Sprinkler', epilog="Copyright (c) E. Zuidema")
-parser.add_argument("-l", "--log", help="Logging level, can be 'none', 'info', 'warning', 'debug', default='none'", default='none')
-parser.add_argument("-f", "--logfile", help="Logging output, can be 'stdout', or filename with path, default='stdout'", default='stdout')
-parser.add_argument("-s", "--server", help="MySQL server or socket path, default='localhost'", default='localhost')
-parser.add_argument("-d", "--days", help="How many days to look back, default 28", default='35')
-parser.add_argument("-u", "--user", help="MySQL user, default='root'", default='root')
-parser.add_argument("-p", "--password", help="MySQL user password, default='password'", default='password')
-args = parser.parse_args()
+import makkink_evaporation
 
-# Handle debugging messages
-if (args.logfile == 'stdout'):
-  if (args.log == 'info'):
-    # info logging to systemd which already lists timestamp
-    logging.basicConfig(format='%(name)s - %(levelname)s - %(message)s')
-  else:
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(lineno)d - %(message)s')
-else:
-  logging.basicConfig(filename=args.logfile,format='%(asctime)s - %(levelname)s - %(lineno)d - %(message)s')
+# Settings for Relay board 2 (water source ball valves)
+valve_drinking_PIN = 35
+valve_barrel_PIN = 36
 
-logger = logging.getLogger(progname)
-if (args.log == 'debug'):
-  logger.setLevel(logging.DEBUG)
-if (args.log == 'warning'):
-  logger.setLevel(logging.WARNING)
-if (args.log == 'info'):
-  logger.setLevel(logging.INFO)
-if (args.log == 'error'):
-  logger.setLevel(logging.ERROR)
+# Settings for I2C HATS Relay board 1 (solenoids for up to 4 irrigation areas)
+Relay_1_BUS = 1
+Relay_1_ADDR = 0x10
+Relay_1_ON = 0xFF
+Relay_1_OFF = 0x00
+valve_grass = 1
+valve_front = 2
+valve_sprinkler = 3
 
-logger.info("Started program %s, version %s", progname, version)
+# Settings for Flow meter GPIO pins
+flow_grass_PIN = 7
+flow_front_PIN = 11
+flow_sprinkler_PIN = 16
 
-host_name = socket.gethostname()
-if (host_name != "raspberrypi-irrigation"):
-  logger.info("Running on %s, emulating RPi behaviour", host_name)
-  emulating = 1
-else:
-  logger.info("Running on %s, running real RPi GPIO", host_name)
-  emulating = 0
 
-days = int(args.days)
-logger.info("Looking back: %d days", days)
+def parse_arguments(logger):
+  ################################################################################################################################################
+  #Commandline arguments parsing
+  ################################################################################################################################################    
+  parser = argparse.ArgumentParser(prog=progname, description='Sprinkler', epilog="Copyright (c) E. Zuidema")
+  parser.add_argument("-l", "--log", help="Logging level, can be 'none', 'info', 'warning', 'debug', default='none'", default='none')
+  parser.add_argument("-f", "--logfile", help="Logging output, can be 'stdout', or filename with path, default='stdout'", default='stdout')
+  parser.add_argument("-d", "--days", help="How many days to look back, default 35 (exclusive with amount)", default='35')
+  parser.add_argument("-a", "--amount", help="How many liters per m2 to irrigate (exclusive with days)", default = '0')
+  parser.add_argument("-z", "--zones", help="Zone(s) to irrigate, can be 'grass', 'sprinkler', 'front' or multiple. Default is all", default='all', nargs='*')
+  parser.add_argument("-b", "--use-barrel", help="Use the Barrel, alternative is use drinking water", default=False, action="store_true")
+  parser.add_argument("-e", "--emulate", help="Do not actually open/close valves or store data", default=False, action="store_true")
+  parser.add_argument("-s", "--server", help="MySQL server or socket path, default='localhost'", default='localhost')
+  parser.add_argument("-u", "--user", help="MySQL user, default='root'", default='root')
+  parser.add_argument("-p", "--password", help="MySQL user password, default='password'", default='password')
+  args = parser.parse_args()
 
-# Check and open MySQL connection
-mysql_host=args.server
-mysql_user=args.user
-mysql_passwd=args.password
-logger.debug("MySQL Server  : %s", mysql_host)
-logger.debug("MySQL User    : %s", mysql_user)
-logger.debug("MySQL Password: %s", mysql_passwd)
-
-logger.info("MySQL Database: weewx")	
-db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='weewx')
-# Catch MySQL warnings if level is warnings
-if logger.isEnabledFor(logging.WARNING):
-  db.get_warnings = True
-cursor = db.cursor()
-
-# Get the per 5m data from the past X days
-# mysql> select dateTime, FROM_UNIXTIME(dateTime), outHumidity, outTemp, pressure, radiation, rain from archive where dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY) LIMIT 10;
-# +------------+-------------------------+-------------+-------------+----------+---------------------+------+
-# | dateTime   | FROM_UNIXTIME(dateTime) | outHumidity | outTemp     | pressure | radiation           | rain |
-# +------------+-------------------------+-------------+-------------+----------+---------------------+------+
-# | 1614630600 | 2021-03-01 21:30:00     |          82 |         4.7 |   1028.1 |                   0 |    0 |
-# | 1614630900 | 2021-03-01 21:35:00     |          82 |      4.6381 |  1028.08 |                   0 |    0 |
-# | 1614631200 | 2021-03-01 21:40:00     |          82 |     4.53333 |  1028.12 |                   0 |    0 |
-# ...
-# | 1614839700 | 2021-03-04 07:35:00     |          88 |         5.1 |   1018.3 |                   0 |  0.3 |
-# | 1614840000 | 2021-03-04 07:40:00     |          88 |         5.1 |  1018.26 |                   0 |    0 |
-# | 1614840300 | 2021-03-04 07:45:00     |          88 |         5.1 |  1018.12 |  0.0744857142857143 |  0.3 |
-# | 1614840600 | 2021-03-04 07:50:00     |          88 |         5.1 |  1018.27 |  0.0744857142857143 |    0 |
-# ...
-# | 1615209000 | 2021-03-08 14:10:00     |      44.619 |     11.0143 |  1019.96 |    631.790574761905 |    0 |
-# | 1615209300 | 2021-03-08 14:15:00     |     43.7143 |     11.6095 |  1019.89 |    614.716605714286 |    0 |
-# | 1615209600 | 2021-03-08 14:20:00     |       41.85 |       11.98 |  1019.88 |         551.6908515 |    0 |
-# | 1615209900 | 2021-03-08 14:25:00     |     40.8571 |      11.981 |  1019.76 |    400.116792380952 |    0 |
-# ...
-# | 1617792000 | 2021-04-07 12:40:00     |        NULL |        NULL |  1014.02 |           295.11714 |    0 |
-# | 1617792300 | 2021-04-07 12:45:00     |        NULL |        NULL |  1014.06 |           295.11714 |    0 |
-# | 1617792600 | 2021-04-07 12:50:00     |        NULL |        NULL |  1014.19 |                NULL |    0 |
-# | 1617792900 | 2021-04-07 12:55:00     |        NULL |        NULL |  1014.28 |                NULL |    0 |
-#
-query = "SELECT FROM_UNIXTIME(dateTime), outHumidity, outTemp, pressure, radiation, rain from archive WHERE dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL " + str(days) + " DAY)"
-logger.debug("Query: %s", query)
-cursor.execute(query)
-records = cursor.fetchall()
-amount = cursor.rowcount
-logger.debug("Amount of datapoints = %d", amount)
-
-humidityDay = numpy.zeros(amount)
-tempDay = numpy.zeros(amount)
-pressureDay = numpy.zeros(amount)
-radiationDay = numpy.zeros(amount)
-rainDay = numpy.zeros(amount)
-rainSum = 0
-
-i = 0
-for row in records:
-  logger.debug("Time = %s", row[0])
-  try:
-    humidityDay[i] = float(row[1])
-    tempDay[i] = float(row[2])
-    # Database is in HPa, need in Pa
-    pressureDay[i] = float(row[3]) * 100
-    # Database is Watt per second, and need Joules / m2
-    # need to x 5 (datapoint per 5 minutes) x 60 (minutes to seconds)
-    radiationDay[i] = float(row[4]) * 5 * 60
-    rainDay[i] = float(row[5])
-  except TypeError:
-    # There was a NULL in the data, so skip this row: continue with next row (and overwrite filled values, as i is not increased)
-    logger.debug("Row skipped due to incorrect data")
-    continue
-  rainSum += rainDay[i]
-  logger.debug("Point %d: Humidity: %.0f %%, Temp: %.1f deg C, Pressure: %.0f Pa, Radiation: %.0f J/m2, Rain: %.1f mm", i, humidityDay[i], tempDay[i], pressureDay[i], radiationDay[i], rainDay[i])
-  i = i + 1
-
-logger.info("Amount of datapoints used: %d", i)
-logger.debug("Deleting %d elements from arrays", amount-i)
-# Remove empty elements at the end if there were errors in the rows
-# Apparently cannot prevent array copying in numpy...
-humidityDay = humidityDay[:i] 
-tempDay = tempDay[:i]
-pressureDay = pressureDay[:i]
-radiationDay = radiationDay[:i]
-rainDay = rainDay[:i]
-
-# Close weewx database
-if (db.is_connected()):
-  db.close()
-  cursor.close()
-  logger.info("MySQL connection is closed")
-
-# Open irrigation database
-logger.info("MySQL Database: irrigation")	
-
-db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='irrigation')    
-# Catch MySQL warnings if level is warnings
-if logger.isEnabledFor(logging.WARNING):
-  db.get_warnings = True
-cursor = db.cursor()
-
-# Get the irrigation from the past X days, watered in liters per m2 = mm
-# mysql> select dateTime, watered, UNIX_TIMESTAMP(NOW()), UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY) from irrigated where dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY);
-# +------------+---------+-----------------------+----------------------------------------+
-# | dateTime   | watered | UNIX_TIMESTAMP(NOW()) | UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY) |
-# +------------+---------+-----------------------+----------------------------------------+
-# | 1614553200 |       0 |            1614673885 |                             1614501085 |
-# | 1614636558 | 1.05394 |            1614673885 |                             1614501085 |
-# +------------+---------+-----------------------+----------------------------------------+
-#
-query = "SELECT FROM_UNIXTIME(dateTime), watered from irrigated WHERE dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL " + str(days) + " DAY)"
-logger.debug("Query: %s", query)
-cursor.execute(query)
-records = cursor.fetchall()
-waterDay = numpy.zeros(days)
-waterSum = 0
-i = 0
-for row in records:
-  logger.debug("Time = %s", row[0])
-  waterDay[i] = float(row[1])
-  waterSum += waterDay[i]
-  logger.debug("Watered day %d = %.1f liters per m2", i, waterDay[i])
-  i = i + 1
-
-# Now calculate the Evaporation of the period
-
-# Supporting routine from http://python.hydrology-amsterdam.nl/moduledoc/_modules/evaplib.html#Em
-# Hosted at https://github.com/Kirubaharan/hydrology/blob/master/checkdam/meteolib.py
-
-def es_calc(airtemp= numpy.array([])):
-  # Input:
-  #    - airtemp: (array of) measured air temperature [Celsius] 
-  # Output:
-  #    - es: (array of) saturated vapour pressure [Pa]
-
-  # Determine length of array
-  n = numpy.size(airtemp)
-  # Check if we have a single (array) value or an array
-  if n < 2:
-    # Calculate saturated vapour pressures, distinguish between water/ice
-    if airtemp < 0:
-      # Calculate saturation vapour pressure for ice
-      log_pi = - 9.09718 * (273.16 / (airtemp + 273.15) - 1.0) \
-               - 3.56654 * math.log10(273.16 / (airtemp + 273.15)) \
-               + 0.876793 * (1.0 - (airtemp + 273.15) / 273.16) \
-               + math.log10(6.1071)
-      es = math.pow(10, log_pi)   
+  # Handle debugging messages
+  if (args.logfile == 'stdout'):
+    if (args.log == 'info'):
+      # info logging to systemd which already lists timestamp
+      logging.basicConfig(format='%(name)s - %(levelname)s - %(message)s')
     else:
-      # Calculate saturation vapour pressure for water
-      log_pw = 10.79574 * (1.0 - 273.16 / (airtemp + 273.15)) \
-               - 5.02800 * math.log10((airtemp + 273.15) / 273.16) \
-               + 1.50475E-4 * (1 - math.pow(10, (-8.2969 * ((airtemp +\
-               273.15) / 273.16 - 1.0)))) + 0.42873E-3 * \
-               (math.pow(10, (+4.76955 * (1.0 - 273.16\
-               / (airtemp + 273.15)))) - 1) + 0.78614
-      es = math.pow(10, log_pw)
-  else:   # Dealing with an array     
-    logger.debug("es_calc - Array (size %d)", n)
-    # Initiate the output array
-    es = numpy.zeros(n)
-    # Calculate saturated vapour pressures, distinguish between water/ice
-    for i in range(0, n):              
-      if airtemp[i] < 0:
-        logger.debug("es_calc - Airtemp below zero")
-        # Saturation vapour pressure equation for ice
-        log_pi = - 9.09718 * (273.16 / (airtemp[i] + 273.15) - 1.0) \
-                 - 3.56654 * math.log10(273.16 / (airtemp[i] + 273.15)) \
-                 + 0.876793 * (1.0 - (airtemp[i] + 273.15) / 273.16) \
-                 + math.log10(6.1071)
-        es[i] = math.pow(10, log_pi)
-      else:
-        logger.debug("es_calc - Airtemp above zero (%.1f)", airtemp[i])
-        # Calculate saturation vapour pressure for water  
-        log_pw = 10.79574 * (1.0 - 273.16 / (airtemp[i] + 273.15)) \
-                 - 5.02800 * math.log10((airtemp[i] + 273.15) / 273.16) \
-                 + 1.50475E-4 * (1 - math.pow(10, (-8.2969\
-                 * ((airtemp[i] + 273.15) / 273.16 - 1.0)))) + 0.42873E-3\
-                 * (math.pow(10, (+4.76955 * (1.0 - 273.16\
-                 / (airtemp[i] + 273.15)))) - 1) + 0.78614
-        es[i] = pow(10, log_pw)
-  # Convert from hPa to Pa
-  es = es * 100.0
-  logger.debug("es_calc - Returning es in Pa (e.g. %d)", es[0])
-  return es # in Pa
+      logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(lineno)d - %(message)s')
+  else:
+    logging.basicConfig(filename=args.logfile,format='%(asctime)s - %(levelname)s - %(lineno)d - %(message)s')
 
-def Delta_calc(airtemp= numpy.array([])):
-  #    Input:
-  #      - airtemp: (array of) air temperature [Celsius]
-  #  Output:
-  #      - Delta: (array of) slope of saturated vapour curve [Pa K-1]
+  if (args.log == 'debug'):
+    logger.setLevel(logging.DEBUG)
+  if (args.log == 'warning'):
+    logger.setLevel(logging.WARNING)
+  if (args.log == 'info'):
+    logger.setLevel(logging.INFO)
+  if (args.log == 'error'):
+    logger.setLevel(logging.ERROR)
 
-  # Determine length of array
-  n = numpy.size(airtemp)
-  # Check if we have a single value or an array
-  if n < 2:   # Dealing with single value...
-    # calculate vapour pressure
-    es = es_calc(airtemp) # in Pa
-    # Convert es (Pa) to kPa
-    es = es / 1000.0
-    # Calculate Delta
-    Delta = es * 4098.0 / math.pow((airtemp + 237.3), 2)*1000
-  else:   # Dealing with an array         
-    logger.debug("Delta_calc - Array (size %d)", n)
-    # Initiate the output arrays
-    Delta = numpy.zeros(n)
-    # calculate vapour pressure
-    es = es_calc(airtemp) # in Pa
-    # Convert es (Pa) to kPa
-    es = es / 1000.0
-    # Calculate Delta
-    for i in range(0, n):
-      Delta[i] = es[i] * 4098.0 / math.pow((airtemp[i] + 237.3), 2)*1000
-  logger.debug("Delta_calc - Returning Delta in Pa/K (e.g. %.1f)", Delta[0])
-  return Delta # in Pa/K
+  if (float(args.amount) <> 0):
+    # If amount is specified, ignore days
+    days = 0
+    amount = float(args.amount)
+    logger.info("Irrigating %.2f mm", amount)
+  else:
+    days = int(args.days)
+    logger.info("Looking back: %d days", days)
+    amount = 0
 
-def ea_calc(airtemp= numpy.array([]),\
-            rh= numpy.array([])):
-  # Input:
-  #    - airtemp: array of measured air temperatures [Celsius]
-  #    - rh: Relative humidity [%]
-  # Output:
-  #    - ea: array of actual vapour pressure [Pa]
+  if args.use_barrel:
+    use_barrel = True
+    logger.debug("using Barrel")
+  else:
+    use_barrel = False
 
-  # Determine length of array
-  n = numpy.size(airtemp)
-  if n < 2:   # Dealing with single value...    
-    # Calculate saturation vapour pressures
-    es = es_calc(airtemp)
-    # Calculate actual vapour pressure
-    eact = float(rh) / 100.0 * es
-  else:   # Dealing with an array
-    logger.debug("ea_calc - Array (size %d)", n)
-    # Initiate the output arrays
-    eact = numpy.zeros(n)
-    # Calculate saturation vapour pressures
-    es = es_calc(airtemp)
-    for i in range(0, n):
-      # Calculate actual vapour pressure
-      eact[i] = float(rh[i]) / 100.0 * es[i]
-  logger.debug("ea_calc - Returning eact in Pa (e.g. %d)", eact[0])
-  return eact # in Pa
+  if args.emulate:
+    emulating = True
+    logger.debug("Emulating only...")
+  else:
+    emulating = False
 
-def cp_calc(airtemp= numpy.array([]),\
-            rh= numpy.array([]),\
-            airpress= numpy.array([])):
-  # Input:
-  #    - airtemp: (array of) air temperature [Celsius]
-  #    - rh: (array of) relative humidity data [%]
-  #    - airpress: (array of) air pressure data [Pa]
-  # Output:
-  #    cp: array of saturated c_p values [J kg-1 K-1]
+  zones = args.zones
+  logger.debug("Zones: %s", zones)
+  
+  mysql_host=args.server
+  mysql_user=args.user
+  mysql_passwd=args.password
+  logger.debug("MySQL Server  : %s", mysql_host)
+  logger.debug("MySQL User    : %s", mysql_user)
+  logger.debug("MySQL Password: %s", mysql_passwd)
 
-  # Determine length of array
-  n = numpy.size(airtemp)
-  # Check if we have a single value or an array
-  if n < 2:   # Dealing with single value...
-    # calculate vapour pressures
-    eact = ea_calc(airtemp, rh)
-    # Calculate cp
-    cp = 0.24 * 4185.5 * (1 + 0.8 * (0.622 * eact / (airpress - eact)))
-  else:   # Dealing with an array
-    logger.debug("cp_calc - Array (size %d)", n)
-    # Initiate the output arrays
-    cp = numpy.zeros(n)
-    # calculate vapour pressures
-    eact = ea_calc(airtemp, rh)
-    # Calculate cp
-    for i in range(0, n):
-      cp[i] = 0.24 * 4185.5 * (1 + 0.8 * (0.622 * eact[i] / (airpress[i] - eact[i])))
-  logger.debug("cp_calc - Returning cp in J/kg/K (e.g. %.1f)", cp[0])
-  return cp # in J/kg/K
+  # return parsed values
+  return (days, amount, zones, use_barrel, emulating, mysql_host, mysql_user, mysql_passwd)
 
-def L_calc(airtemp= numpy.array([])):
-  # Input:
-  #    - airtemp: (array of) air temperature [Celsius]
-  # Output:
-  #    - L: (array of) lambda [J kg-1 K-1]
+def load_evaporation( logger, \
+                      days, \
+                      mysql_host, \
+                      mysql_user, \
+                      mysql_passwd  ):
 
-  # Determine length of array
-  n = numpy.size(airtemp)
-  # Check if we have a single value or an array
-  if n < 2:   # Dealing with single value...
-    # Calculate lambda
-    L = 4185.5 * (751.78 - 0.5655 * (airtemp + 273.15))
-  else:   # Dealing with an array
-    logger.debug("L_calc - Array (size %d)", n)
-    # Initiate the output arrays
-    L = numpy.zeros(n)    
-    # Calculate lambda
-    for i in range(0, n):
-      L[i] = 4185.5 * (751.78 - 0.5655 * (airtemp[i] + 273.15))
-  logger.debug("L_calc - Returning Lambda in J/kg (e.g. %.1f)", L[0])
-  return L # in J/kg
+  logger.info("Opening MySQL Database weewx on %s", mysql_host)
+  db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='weewx')
+  cursor = db.cursor()
 
-def gamma_calc(airtemp= numpy.array([]),\
-               rh= numpy.array([]),\
-               airpress=numpy.array([])):
-  # Input:
-  #    - airtemp: array of measured air temperature [Celsius]
-  #    - rh: array of relative humidity values[%]
-  #    - airpress: array of air pressure data [Pa]        
-  # Output:
-  #    - gamma: array of psychrometric constant values [Pa\K]
-
-  # Determine length of array
-  n = numpy.size(airtemp)
-  # Check if we have a single value or an array
-  if n < 2:   # Dealing with single value...
-    cp = cp_calc(airtemp, rh, airpress)
-    L = L_calc(airtemp)
-    # Calculate gamma
-    gamma = cp * airpress / (0.622 * L)
-  else:   # Dealing with an array
-    logger.debug("gamma_calc - Array (size %d)", n)
-    # Initiate the output arrays
-    gamma = numpy.zeros(n)
-    # Calculate cp and Lambda values
-    cp = cp_calc(airtemp, rh, airpress)
-    L = L_calc(airtemp)
-    # Calculate gamma
-    for i in range(0, n):
-      gamma[i] = cp[i] * airpress[i] / (0.622 * L[i])
-  logger.debug("gamma_calc - Returning Gamma in Pa\K (e.g. %.1f)", gamma[0])
-  return gamma # in Pa\K
-
-def Em(airtemp = numpy.array([]),\
-       rh = numpy.array([]),\
-       airpress = numpy.array([]),\
-       Rs = numpy.array([])):
-
-  # airtemp: (array of) daily average air temperatures [Celsius]
-  # rh: (array of) daily average relative humidity values [%]
-  # airpress: (array of) daily average air pressure data [Pa]
-  # Rs (Kin in formula): (array of) average daily incoming solar radiation [J m-2 day-1]
+  # Get the per 5m data from the past X days
+  # mysql> select dateTime, FROM_UNIXTIME(dateTime), outHumidity, outTemp, pressure, radiation, rain from archive where dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY) LIMIT 10;
+  # +------------+-------------------------+-------------+-------------+----------+---------------------+------+
+  # | dateTime   | FROM_UNIXTIME(dateTime) | outHumidity | outTemp     | pressure | radiation           | rain |
+  # +------------+-------------------------+-------------+-------------+----------+---------------------+------+
+  # | 1614630600 | 2021-03-01 21:30:00     |          82 |         4.7 |   1028.1 |                   0 |    0 |
+  # | 1614630900 | 2021-03-01 21:35:00     |          82 |      4.6381 |  1028.08 |                   0 |    0 |
+  # | 1614631200 | 2021-03-01 21:40:00     |          82 |     4.53333 |  1028.12 |                   0 |    0 |
+  # ...
+  # | 1614839700 | 2021-03-04 07:35:00     |          88 |         5.1 |   1018.3 |                   0 |  0.3 |
+  # | 1614840000 | 2021-03-04 07:40:00     |          88 |         5.1 |  1018.26 |                   0 |    0 |
+  # | 1614840300 | 2021-03-04 07:45:00     |          88 |         5.1 |  1018.12 |  0.0744857142857143 |  0.3 |
+  # | 1614840600 | 2021-03-04 07:50:00     |          88 |         5.1 |  1018.27 |  0.0744857142857143 |    0 |
+  # ...
+  # | 1615209000 | 2021-03-08 14:10:00     |      44.619 |     11.0143 |  1019.96 |    631.790574761905 |    0 |
+  # | 1615209300 | 2021-03-08 14:15:00     |     43.7143 |     11.6095 |  1019.89 |    614.716605714286 |    0 |
+  # | 1615209600 | 2021-03-08 14:20:00     |       41.85 |       11.98 |  1019.88 |         551.6908515 |    0 |
+  # | 1615209900 | 2021-03-08 14:25:00     |     40.8571 |      11.981 |  1019.76 |    400.116792380952 |    0 |
+  # ...
+  # | 1617792000 | 2021-04-07 12:40:00     |        NULL |        NULL |  1014.02 |           295.11714 |    0 |
+  # | 1617792300 | 2021-04-07 12:45:00     |        NULL |        NULL |  1014.06 |           295.11714 |    0 |
+  # | 1617792600 | 2021-04-07 12:50:00     |        NULL |        NULL |  1014.19 |                NULL |    0 |
+  # | 1617792900 | 2021-04-07 12:55:00     |        NULL |        NULL |  1014.28 |                NULL |    0 |
   #
-  # output is (array of) Makkink evaporation values [mm day-1]
+  query = "SELECT FROM_UNIXTIME(dateTime), outHumidity, outTemp, pressure, radiation, rain from archive WHERE dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL " + str(days) + " DAY)"
+  logger.debug("Query: %s", query)
+  cursor.execute(query)
+  records = cursor.fetchall()
+  amount = cursor.rowcount
+  logger.debug("Amount of datapoints = %d", amount)
 
-  # Calculate Delta and gamma constants
-  DELTA =  Delta_calc(airtemp)
-  gamma =  gamma_calc(airtemp,rh,airpress)
-  Lambda = L_calc(airtemp)
-  # Determine length of array
-  l = numpy.size(airtemp)
-  # Check if we have a single value or an array
-  if l < 2:   # Dealing with single value...
-    logger.debug("Em - Single value")
-    # calculate Em [mm/day]
-    Em = 0.65 * DELTA/(DELTA + gamma) * Rs / Lambda
-  else:   # Dealing with an array         
-    # Initiate output array
-    logger.debug("Em - Array (size %d)", l)
-    Em = numpy.zeros(l)
-    for i in range(0,l):   
-      # calculate Em [mm/day]
-      Em[i]= 0.65*DELTA[i]/(DELTA[i]+gamma[i])*Rs[i]/Lambda[i]
-      logger.debug("Em = %.3f (Delta = %.1f, gamma = %.1f, Rs = %.1f, Lambda = %.1f)", Em[i], DELTA[i], gamma[i], Rs[i], Lambda[i])
-  logger.debug("Em - Returning Em in mm/day (e.g. %.3f)", Em[0])
-  return Em
+  humidityDay = numpy.zeros(amount)
+  tempDay = numpy.zeros(amount)
+  pressureDay = numpy.zeros(amount)
+  radiationDay = numpy.zeros(amount)
+  rainDay = numpy.zeros(amount)
+  rainSum = 0
 
-# Calculate Evaporation with Makkink formula
-evap = Em(tempDay, humidityDay, pressureDay, radiationDay)
+  i = 0
+  for row in records:
+    logger.debug("Time = %s", row[0])
+    try:
+      humidityDay[i] = float(row[1])
+      tempDay[i] = float(row[2])
+      # Database is in HPa, need in Pa
+      pressureDay[i] = float(row[3]) * 100
+      # Database is Watt per second, and need Joules / m2
+      # need to x 5 (datapoint per 5 minutes) x 60 (minutes to seconds)
+      radiationDay[i] = float(row[4]) * 5 * 60
+      rainDay[i] = float(row[5])
+    except TypeError:
+      # There was a NULL in the data, so skip this row: continue with next row (and overwrite filled values, as i is not increased)
+      logger.debug("Row skipped due to incorrect data")
+      continue
+    # rainSum CAN BE REMOVED, not returned anyway...
+    rainSum += rainDay[i]
+    logger.debug("Point %d: Humidity: %.0f %%, Temp: %.1f deg C, Pressure: %.0f Pa, Radiation: %.0f J/m2, Rain: %.1f mm", i, humidityDay[i], tempDay[i], pressureDay[i], radiationDay[i], rainDay[i])
+    i = i + 1
 
-evapSum = numpy.sum(evap)
-logger.info("Evaporation = %.1f mm in last %d days", evapSum, days)
-logger.debug("              (%s)", str(numpy.around(evap, 3)))
-logger.info("Rainfall    = %.1f mm in last %d days", rainSum, days)
-logger.info("Watering    = %.1f mm in last %d days", waterSum, days)
+  logger.info("Amount of datapoints used: %d", i)
+  logger.debug("Deleting %d elements from arrays", amount-i)
+  # Remove empty elements at the end if there were errors in the rows
+  # Apparently cannot prevent array copying in numpy...
+  humidityDay = humidityDay[:i]
+  tempDay = tempDay[:i]
+  pressureDay = pressureDay[:i]
+  radiationDay = radiationDay[:i]
+  rainDay = rainDay[:i]
 
-# Now calculate shortage = evaporation - rain - watering
-net_evap = evapSum - rainSum - waterSum
-print("Net Evaporation = %.1f mm in last %d days" % (net_evap, days))
-if net_evap <= 1:
-  print("No need for irrigation (<= 1mm / 1 liter per m2)")
+  # Close weewx database
+  if (db.is_connected()):
+    db.close()
+    cursor.close()
+    logger.info("MySQL connection is closed")
+
+  # return the collected values
+  return tempDay, humidityDay, pressureDay, radiationDay, rainDay
+
+def load_irrigated( logger, \
+                    days, \
+                    mysql_host, \
+                    mysql_user, \
+                    mysql_passwd  ):
+
+  # Open irrigation database
+  logger.info("Opening MySQL Database irrigation on %s", mysql_host)
+
+  db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='irrigation')
+  cursor = db.cursor()
+
+  # Get the irrigation from the past X days, watered in liters per m2 = mm
+  # mysql> select dateTime, watered, UNIX_TIMESTAMP(NOW()), UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY) from irrigated where dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY);
+  # +------------+---------+-----------------------+----------------------------------------+
+  # | dateTime   | watered | UNIX_TIMESTAMP(NOW()) | UNIX_TIMESTAMP(NOW() - INTERVAL 2 DAY) |
+  # +------------+---------+-----------------------+----------------------------------------+
+  # | 1614553200 |       0 |            1614673885 |                             1614501085 |
+  # | 1614636558 | 1.05394 |            1614673885 |                             1614501085 |
+  # +------------+---------+-----------------------+----------------------------------------+
+  #
+  query = "SELECT FROM_UNIXTIME(dateTime), watered from irrigated WHERE dateTime >= UNIX_TIMESTAMP(NOW() - INTERVAL " + str(days) + " DAY)"
+  logger.debug("Query: %s", query)
+  cursor.execute(query)
+  records = cursor.fetchall()
+  amount = cursor.rowcount
+  waterDay = numpy.zeros(amount)
+  waterSum = 0
+  i = 0
+  for row in records:
+    waterDay[i] = float(row[1])
+    # waterSum CAN BE REMOVED (not returned)
+    waterSum += waterDay[i]
+    logger.debug("Point %d: Time: %s Irrigation: %.1f liters per m2", i, row[0], waterDay[i])
+    i = i + 1
+
   # Close irrigation database
   if (db.is_connected()):
     db.close()
     cursor.close()
-  logger.info("MySQL connection is closed")
-  print("Done.")
-  sys.exit(1)
+    logger.info("MySQL connection is closed")
 
-# Continue with irrigation
-logger.info("Need to add %.1f liters per m2 to garden", net_evap)
+  # Return the collected values
+  return waterDay
 
-from datetime import datetime
-if (not emulating):
-  import RPi.GPIO as GPIO
-  import smbus
+
+def save_irrigated( logger, \
+                    mysql_host, \
+                    mysql_user, \
+                    mysql_passwd, \
+                    watering_mm  ):
+
+  # Open irrigation database
+  logger.info("Opening MySQL Database irrigation on %s", mysql_host)
+
+  db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='irrigation')
+  cursor = db.cursor()
+
+  # Add irrigation amount (mm) to database
+  query = "INSERT INTO irrigated (dateTime, watered) VALUES (%s, %s)"
+  insert_time = time.time()
+  insert_water = watering_mm
+  values = (insert_time, insert_water)
+  logger.debug("Query: %s", query)
+  logger.debug("Values: %d, %f", insert_time, insert_water)
+  cursor.execute(query, values)
+  db.commit()
+  logger.info("Added irrigation of %d mm to database", watering_mm)
+
+  # Close irrigation database
+  if (db.is_connected()):
+    db.close()
+    cursor.close()
+    logger.info("MySQL connection is closed")
+
+  # return
+
+
+class WaterSource():
+  
+  def __init__(self, logger, name, relay_pin):
+    self.logger = logger
+    self.logger.debug("WaterSource init for %s", name)
+    self.name = name
+    self.relay_pin = relay_pin
+
+  def get_name(self):
+    return self.name
+
+  def barrel(self):
+    return "barrel" in self.name.lower()
+
+  def open_valve(self):
+    self.logger.info("Setting %s water ON", self.name)
+    GPIO.output(self.relay_pin, GPIO.HIGH)
+
+  def close_valve(self):
+    self.logger.info("Setting %s water OFF", self.name)
+    GPIO.output(self.relay_pin, GPIO.LOW)
+
+
+class IrrigationZone():
+  
+  def __init__(self, logger, name, relay_bus, relay_pin, area, flow_pin, use_barrel = True):
+    self.logger = logger
+    self.logger.debug("IrrigationZone init for %s", name)
+    self.name = name
+    self.area = area
+    self.irrigated_liters = 0
+    self.relay_bus = relay_bus
+    self.relay_pin = relay_pin
+    self.flow_pin = flow_pin
+    self.use_barrel = use_barrel
+
+    # Start a flowmeter associated with this zone
+    self.flow_meter = FlowMeter(self.logger, self.name + " (PIN " + str(flow_pin) + ")")
+
+  def get_name(self):
+    return self.name
+
+  def no_barrel(self):
+    return not self.use_barrel
+    
+  def get_area(self):
+    return self.area
+
+  def open_valve(self):
+    self.logger.info("Setting %s zone ON", self.name)
+    self.relay_bus.write_byte_data(Relay_1_ADDR, self.relay_pin, Relay_1_ON)
+
+  def close_valve(self):
+    self.logger.info("Setting %s zone OFF", self.name)
+    self.relay_bus.write_byte_data(Relay_1_ADDR, self.relay_pin, Relay_1_OFF)
+
+  def get_flow_pin(self):
+    return self.flow_pin
+
+  def set_pulse_callback(self):
+    self.logger.debug("%s: set_pulse_callback:", self.name)
+    GPIO.add_event_detect(self.flow_pin, GPIO.RISING, callback=self.flow_meter.pulseCallback, bouncetime=20)
+
+  def clear_pulse_callback(self):
+    self.logger.debug("%s: clear_pulse_callback:", self.name)
+    GPIO.remove_event_detect(self.flow_pin)
+
+  def get_flow_rate(self):
+    self.logger.debug("%s: get_flow_rate:", self.name)
+    return self.flow_meter.getFlowRate()
+
+  def get_irrigated_liters(self):
+    return self.irrigated_liters
+
+  def set_irrigated_liters(self, actual):
+    self.irrigated_liters = actual
 
 class FlowMeter():
   ''' Class representing the flow meter sensor which handles input pulses
       and calculates current flow rate (L/min) measurement
   '''
-  
-  def __init__(self):
-    logger.debug("Flow init, setting last_time to now, and rate to 0")
+
+  def __init__(self, logger, name):
+    self.logger = logger
+    self.logger.debug("Flow init for %s, setting last_time to now, and rate to 0", name)
+    self.name = name
     self.flow_rate = 0.0
     self.last_time = datetime.now()
-  
+
   def pulseCallback(self, p):
-    ''' Callback that is executed with each pulse 
-        received from the sensor 
+    ''' Callback that is executed with each pulse
+        received from the sensor
     '''
-  
-    logger.debug("pulseCallback: Flowing!") 
-    # Calculate the time difference since last pulse recieved
+
+    self.logger.debug("%s: pulseCallback: Flowing!", self.name)
+    # Calculate the time difference since last pulse received
     current_time = datetime.now()
     diff = (current_time - self.last_time).total_seconds()
 
-    if(diff < 2):       
+    if(diff < 2):
       # Calculate current flow rate
-      hertz = 1. / diff
+      hertz = 1.0 / diff
       self.flow_rate = hertz / 7.5
-      logger.debug("Rate: %f (diff %f s)" % (self.flow_rate, diff))
+      self.logger.debug("pC Rate: %.1f (diff %.3f s)" % (self.flow_rate, diff))
     else:
       # Took too long, setting rates to 0
       self.flow_rate = 0.0
-      logger.debug("Took too long (%f s), setting flow rate to 0" % diff)
-   
+      self.logger.debug("pC Took too long (%.0f s), setting flow rate to 0" % diff)
+
     # Reset time of last pulse
     self.last_time = current_time
+    self.logger.debug("pC last_time = %s" % self.last_time)
 
   def getFlowRate(self):
-    ''' Return the current flow rate measurement. 
-        If a pulse has not been received in last second, 
+    ''' Return the current flow rate measurement.
+        If a pulse has not been received in last second,
         assume that flow has stopped and set flow rate to 0.0
     '''
 
-    logger.debug("getFlowRate:")
+    self.logger.debug("%s: getFlowRate:", self.name)
     current_time = datetime.now()
+    self.logger.debug("gF current_time = %s, last_time = %s" % (current_time, self.last_time))
     diff = (current_time - self.last_time).total_seconds()
     if (diff >= 2):
-      # Took too long, setting rates to 0
-      logger.debug("Took too long (%.0f s), setting flow rate to 100" % diff)
-      self.flow_rate = 100.0
-    if (diff <= 0.01):
-      logger.debug("Took too short (%f s), setting flow rate to 100" % diff)
-      self.flow_rate = 100.0
+#      self.logger.debug("gF Took too long (%.0f s), setting flowrate to 0" % diff)
+#      self.flow_rate = 0.0
+      self.logger.debug("gF Took too long (%.0f s), setting flowrate to 0.1" % diff)
+      self.flow_rate = 0.1
+    if (diff < 0.01):
+      self.logger.debug("gF Took too short (%f s), not updating flowrate..." % diff)
+#      self.logger.debug("gF Took too short (%f s), setting flowrate to 10" % diff)
+#      self.flow_rate = 10.0
 
+    self.logger.debug("Returning flow rate of %.1f (diff %.3f s)" % (self.flow_rate, diff))
     return self.flow_rate
 
-if (not emulating):
-  # Settings for Relay board 1 (solenoid)
-  Relay_1_BUS = 1
-  Relay_1_ADDR = 0x10
-  bus = smbus.SMBus(Relay_1_BUS)
-  Relay_1_ON = 0xFF
-  Relay_1_OFF = 0x00
+# Main
+def main():
+  ################################################################################################################################################
+  #Main program
+  ################################################################################################################################################
+  print("%s (version %s)" % (progname, version))
+  #print("Python version %s.%s.%s" % sys.version_info[:3])
+  #print("Control-C to abort")
 
-  # Settings for Flow meter GPIO pins
-  Flow_1_PIN = 7
-  Flow_2_PIN = 7
-  Flow_3_PIN = 7
-  GPIO.setmode(GPIO.BOARD)
-  GPIO.setup(Flow_1_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-  GPIO.setup(Flow_2_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-  GPIO.setup(Flow_3_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+  logger = logging.getLogger(progname)
 
-  # Settings for Relay board 2 (ball valves)
-  Relay_2_1_PIN = 35
-  Relay_2_2_PIN = 36
-  GPIO.setmode(GPIO.BOARD)
-  GPIO.setup(Relay_2_1_PIN, GPIO.OUT, initial=GPIO.LOW)
-  GPIO.setup(Relay_2_2_PIN, GPIO.OUT, initial=GPIO.LOW)
+  (days, amount, zones_to_water, use_barrel, emulating, mysql_host, mysql_user, mysql_passwd) = parse_arguments(logger)
+  logger.info("Started program %s, version %s", progname, version)
 
-# Init FlowMeter instance and pulse callback
-flow_meter_1 = FlowMeter()
-flow_meter_2 = FlowMeter()
-flow_meter_3 = FlowMeter()
-
-if (not emulating):
-  GPIO.add_event_detect(Flow_1_PIN, GPIO.RISING, callback=flow_meter_1.pulseCallback, bouncetime=20)
-  GPIO.add_event_detect(Flow_2_PIN, GPIO.RISING, callback=flow_meter_2.pulseCallback, bouncetime=20)
-  GPIO.add_event_detect(Flow_3_PIN, GPIO.RISING, callback=flow_meter_3.pulseCallback, bouncetime=20)
-
-# Use drinking water, not rain barrel
-use_barrel = False
-
-# Zone 1: Grass sweat (Valve Relay 1_1, Flow 1)
-if use_barrel: print("Watering Grass (sweat pipes) from barrel...")
-else: print("Watering Grass (sweat pipes) from drinking water...")
-valve = 1
-area = 10 * 8
-liters = area * net_evap
-logger.info("Need to put %.0f liters on the grass", liters)   
-
-# start water source
-if use_barrel:
-  logger.info("Setting RAIN (barrel) water ON")
-  if (not emulating): GPIO.output(Relay_2_2_PIN, GPIO.HIGH)
-else:
-  logger.info("Setting DRINKING water ON")
-  if (not emulating): GPIO.output(Relay_2_1_PIN, GPIO.HIGH)
-logger.info("Waiting 15 seconds for valve to fully open...")
-sleep(15)
-
-# start irrigation flow
-logger.info("Setting grass relay %d to ON", valve)   
-if (not emulating): bus.write_byte_data(Relay_1_ADDR, 1, Relay_1_ON)
-start_time = datetime.now()
-actual_liters = 0.0
-
-# Get current timestamp and flow meter reading
-flow_rate_1 = flow_meter_1.getFlowRate()
-logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate_1)
-duration = liters / flow_rate_1 * 60
-logger.info("Stopping in about %d seconds", duration)
-previous_time = start_time
-
-while duration > 0:
-  sleep(min(60, duration))
-  current_time = datetime.now()
-  current_seconds = (current_time - previous_time).total_seconds()
-  flow_rate_1 = flow_meter_1.getFlowRate()
-  logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate_1)
-  actual_liters += current_seconds / 60 * flow_rate_1
-  duration = (liters - actual_liters) / flow_rate_1 * 60 
-  if duration > 0:
-    logger.info("Watered %.0f liters, %.0f liters remaining (ready in about %d seconds)", actual_liters, liters - actual_liters, duration)
-    previous_time = current_time
+  host_name = socket.gethostname()
+  if (emulating or "raspberrypi" not in host_name):
+    logger.info("Running on %s, emulating RPi behaviour", host_name)
+    emulating = True
   else:
-    logger.info("Watered %.0f liters", actual_liters)
+    logger.info("Running on %s, running real RPi GPIO", host_name)
+    emulating = False
 
-# stop irrigation flow
-logger.info("Setting grass relay %d to OFF", valve)   
-if (not emulating): bus.write_byte_data(Relay_1_ADDR, 1, Relay_1_OFF)
-stop_time = datetime.now()
+  # Setting Raspberry Pi IO
+  if (not emulating):
+    # Set reference to PIN numbers
+    GPIO.setmode(GPIO.BOARD)
 
-# stop water source
-if use_barrel:
-  logger.info("Setting rain (barrel) water OFF")
-  if (not emulating): GPIO.output(Relay_2_2_PIN, GPIO.LOW)
-else:
-  logger.info("Setting drinking water OFF")
-  if (not emulating): GPIO.output(Relay_2_1_PIN, GPIO.LOW)
-logger.info("Waiting 15 seconds for valve to fully close...")
-sleep(15)
+    # Settings for Relay board 2 (water source ball valves to LOW = Closed)
+    GPIO.setup(valve_barrel_PIN,   GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(valve_drinking_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-# Calculate actual watering
-diff_time = (stop_time - start_time).total_seconds()
-watering = diff_time * flow_rate_1 / 60
-watering_mm = watering / area
-logger.debug("Actual watering: time %d seconds, %.0f liters = %.1f mm", diff_time, watering, watering_mm)
+    # Settings for Relay board 1 (solenoids for up to 4 irrigation areas)
+    bus = smbus.SMBus(Relay_1_BUS)
 
-sleep(10)
-
-# Zone 2: Front garden drip (Valve Relay 1_2, Flow 2)
-if use_barrel: print("Watering Front garden (drip pipes) from barrel...")
-else: print("Watering Front garden (drip pipes) from drinking water...")
-valve = 2
-area = 10 * 4 + 8 * 4
-liters = area * net_evap
-logger.info("Need to put %.0f liters on the front garden", liters)   
-
-# start water source
-if use_barrel:
-  logger.info("Setting RAIN (barrel) water ON")
-  if (not emulating): GPIO.output(Relay_2_2_PIN, GPIO.HIGH)
-else:
-  logger.info("Setting DRINKING water ON")
-  if (not emulating): GPIO.output(Relay_2_1_PIN, GPIO.HIGH)
-logger.info("Waiting 15 seconds for valve to fully open...")
-sleep(15)
-
-# start irrigation flow
-logger.info("Setting front garden relay %d to ON", valve)   
-if (not emulating): bus.write_byte_data(Relay_1_ADDR, 2, Relay_1_ON)
-start_time = datetime.now()
-actual_liters = 0.0
-
-# Get current timestamp and flow meter reading
-flow_rate_2 = flow_meter_2.getFlowRate()
-logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate_2)
-duration = liters / flow_rate_2 * 60
-logger.info("Stopping in about %d seconds", duration)
-previous_time = start_time
-
-while duration > 0:
-  sleep(min(60, duration))
-  current_time = datetime.now()
-  current_seconds = (current_time - previous_time).total_seconds()
-  flow_rate_2 = flow_meter_2.getFlowRate()
-  logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate_2)
-  actual_liters += current_seconds / 60 * flow_rate_2
-  duration = (liters - actual_liters) / flow_rate_2 * 60 
-  if duration > 0:
-    logger.info("Watered %.0f liters, %.0f liters remaining (ready in about %d seconds)", actual_liters, liters - actual_liters, duration)
-    previous_time = current_time
+    # Settings for flow meters
+    GPIO.setup(flow_grass_PIN,     GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(flow_front_PIN,     GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(flow_sprinkler_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
   else:
-    logger.info("Watered %.0f liters", actual_liters)
+    bus = 0
 
-# stop flow
-logger.info("Setting front garden relay %d to OFF", valve)   
-if (not emulating): bus.write_byte_data(Relay_1_ADDR, 2, Relay_1_OFF)
-stop_time = datetime.now()
+  # Done setting up, now starting main program
 
-# stop water source
-if use_barrel:
-  logger.info("Setting rain (barrel) water OFF")
-  if (not emulating): GPIO.output(Relay_2_2_PIN, GPIO.LOW)
-else:
-  logger.info("Setting drinking water OFF")
-  if (not emulating): GPIO.output(Relay_2_1_PIN, GPIO.LOW)
-logger.info("Waiting 15 seconds for valve to fully close...")
-sleep(15)
+  # Load evaporation history if days is specficied (alternative is irrigating fixed amount)
+  if (days > 0):
+    (tempDay, humidityDay, pressureDay, radiationDay, rainDay) = load_evaporation(logger, days, mysql_host, mysql_user, mysql_passwd)
+    waterDay = load_irrigated(logger, days, mysql_host, mysql_user, mysql_passwd)
+    
+    evap = makkink_evaporation.Em(logger, tempDay, humidityDay, pressureDay, radiationDay)
 
+    evapSum = numpy.sum(evap)
+    rainSum = numpy.sum(rainDay)
+    waterSum = numpy.sum(waterDay)
 
-# Add irrigation amount (mm) to database
-query = "INSERT INTO irrigated (dateTime, watered) VALUES (%s, %s)"
-insert_time = time.time()
-insert_water = watering_mm
-values = (insert_time, insert_water)
-logger.debug("Query: %s", query)
-logger.debug("Values: %d, %f", insert_time, insert_water)
-if (not emulating):
-  logger.debug("Adding to database")
-  cursor.execute(query, values)
-  db.commit()
+    logger.info("Evaporation = %.1f mm in last %d days", evapSum, days)
+    logger.debug("              (%s)", str(numpy.around(evap, 3)))
+    logger.info("Rainfall    = %.1f mm in last %d days", rainSum, days)
+    logger.info("Watering    = %.1f mm in last %d days", waterSum, days)
 
-# Close irrigation database
-if (db.is_connected()):
-  db.close()
-  cursor.close()
-  logger.info("MySQL connection is closed")
+    # Now calculate shortage = evaporation - rain - watering
+    net_evap = evapSum - rainSum - waterSum
+    print("Net Evaporation = %.1f mm in last %d days" % (net_evap, days))
 
-print("Done.")
+    if net_evap <= 1:
+      print("No need for irrigation (<= 1mm / 1 liter per m2)")
+      print("Done.")
+      sys.exit(1)
+    else:
+      liters_per_m2 = net_evap
+  else:
+    liters_per_m2 = amount
+  
+  # If need to irrigate, set up sources & zones
+  # Init sources, start with most durable one (will start with source 0), until empty (no flow)
+  sources = []
+  sources.append(WaterSource(logger, "Barrel", valve_barrel_PIN))
+  sources.append(WaterSource(logger, "Drinking", valve_drinking_PIN))
+
+  # Init zones
+  zones = []
+  zones.append(IrrigationZone(logger, "Grass (sweat)", bus, valve_grass, 10 * 8, flow_grass_PIN))
+  zones.append(IrrigationZone(logger, "Front (drip)", bus, valve_front, 12 * 4 + 8 * 4, flow_front_PIN))
+  # For sprinkler do not use barrel (hence the False at the end)
+  zones.append(IrrigationZone(logger, "Side (sprinkler)", bus, valve_sprinkler, 10 * 4, flow_sprinkler_PIN, False))
+
+  # Start irrigation
+  # start with first water source (most durable)
+  source_index = 0
+  source = sources[source_index]
+  
+  for zone in zones:
+    if (zones_to_water <> "all"):
+      skip = False
+      for zone_to_water in zones_to_water:
+        if (zone_to_water not in zone.get_name().lower()):
+          # Skip this zone
+          logger.debug("Skipping zone %s, as %s not in %s", zone.get_name(), zone.get_name().lower(), zones_to_water)
+          skip = True
+          break
+      if (skip): continue # next zone in zones
+
+    # Make sure we use the right source for the zone
+    if (zone.no_barrel() and source.barrel()):
+      # Zone requires non-barrel source (e.g. due to water pressure needed)
+      if (source_index < len(sources)-1):
+        source_index += 1
+      else:
+        # Last item in list, move to beginning
+        source_index = 0
+      source = sources[source_index]
+
+    # Calculate liters for this zone area
+    liters = zone.get_area() * liters_per_m2
+    logger.info("Starting zone %s with source %s:", zone.get_name(), source.get_name())
+    logger.info("Need to put %.0f liters on the %d m2 area", liters, zone.get_area())
+
+    if (not emulating):
+      # Init flowmeter callback
+      zone.set_pulse_callback()    
+      # Open zone valve
+      zone.open_valve()
+      # Open source valve
+      source.open_valve()      
+
+    # Measure flow and wait till finished (net_evap or amount)
+    start_time = datetime.now()
+    actual_liters = 0.0
+
+    # Get current timestamp and first flow meter reading
+    flow_rate = zone.get_flow_rate()
+    logger.debug("Flow rate: %.0f liter(s) per minute", flow_rate)
+    # If flowrate is still zero, use 1 liter per minute to initiate
+    duration = liters / max(flow_rate, 1) * 60
+    logger.info("Stopping in about %d seconds", duration)
+    previous_time = start_time
+
+    while duration > 0:
+      try:
+        # Monitor every 10 seconds
+        sleep(min(10, duration))
+      except KeyboardInterrupt:
+        # Close the valves and exit program
+        logger.info("Interrupted; closing valves and exiting...")
+        if (not emulating):
+          zone.close_valve()
+          source.close_valve()
+          GPIO.cleanup()
+        exit(-1)
+      # Check current flow and remaining time
+      current_time = datetime.now()
+      current_seconds = (current_time - previous_time).total_seconds()
+      flow_rate = zone.get_flow_rate()
+      logger.debug("Flow rate: %.0f liter(s) per minute, during %d seconds", flow_rate, current_seconds)
+      actual_liters += current_seconds / 60 * flow_rate
+      duration = (liters - actual_liters) / flow_rate * 60 
+      if duration > 0:
+        logger.info("Watered %.0f liters from %s, %.0f liters remaining (ready in about %d seconds)", actual_liters, source.get_name(), liters - actual_liters, duration)
+        previous_time = current_time
+      else:
+        logger.info("Ended zone %s having watered %.1f liters", zone.get_name(), actual_liters)
+
+    # Done watering this zone, closing valve
+    if (not emulating):
+      zone.close_valve()
+      # Also close source valve, as next zone may need different source
+      source.close_valve()
+      sleep(15)
+      # Remove flowmeter callback
+      zone.clear_pulse_callback()    
+
+    # Calculate liters per m2 irrigated
+    zone.set_irrigated_liters(actual_liters)
+    
+  # Done iterating over all zones
+  actual_liters = 0
+  actual_liters_per_m2 = 0
+  for zone in zones:
+    actual_liters += zone.get_irrigated_liters()
+    actual_liters_per_m2 += zone.get_irrigated_liters() / zone.get_area()
+  logger.info("Ended irrigation having watered %.1f liters (%.1f mm)", actual_liters, actual_liters_per_m2)
+
+  # Store irrigation in database
+  if (not emulating):
+    save_irrigated(logger, mysql_host, mysql_user, mysql_passwd, actual_liters_per_m2)
+    # Clean GPIO settings
+    GPIO.cleanup()
+  
+  print("Main Done.")
+
+if __name__ == '__main__':
+   main()
