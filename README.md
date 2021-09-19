@@ -1,5 +1,5 @@
 # Automatic Irrigation
- Raspberry Pi script for automatic irrigation based on weatherstation data.
+Raspberry Pi script for automatic irrigation based on weatherstation data.
  
  * Python script to be launched preferably during night time
  * Reads Weatherstation data of past days from WeeWX database
@@ -12,6 +12,9 @@
  * Writes the amount of millimeter watered in database
 
 Still in beta phase; all parts functional, but needs to be finetuned.
+
+## Electronic circuit used
+See https://github.com/EdwinGH/automatic-irrigation/blob/main/circuit.png
 
 ## How to run
 Crontab on Raspberry Pi to start and monitor the process:
