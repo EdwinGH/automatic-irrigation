@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Sprinkler system
+# Irrigation system
 # Release 2020-07-05 First version
 # Release 2021-02-09 Added queries
 # Release 2021-02-22 Added meteolib and caluclation of Evaporation via Makkink formula
@@ -20,14 +20,20 @@
 # Release 2021-05-14 Debugging connection issues with fetching row by row
 # Release 2021-05-25 Fixing RPi import error to run correctly (emulating) on development host
 # Release 2021-06-04 Fixed some logging, added shadow factor (how much a zone is exposed to the sun)
-# Release 2021-06-07 Added SigTerm to gracefully exit the process 
+# Release 2021-06-07 Added SigTerm to gracefully exit the process
+# Release 2021-06-12 Renamed to 'irrigate', changed relay for grass to 4, and pin sprinkler to 15
+# Release 2021-08-07 Added file logging also going to systemd log (journal), added better messages when no water sources
+# Release 2021-09-12 Replaced relay board, re-distributed PINs
+# Release 2021-09-18 Added MAX_IRRIGATION to limit daily amount of water
 #
 # TODO
 # - Issue with flow vs pressure: Sprinklers generate flow of only ~2, but pressure is good...
 # - Fix multiple zone logging on command line (split the command line and find splitted in list)
-# - Add expected flow rate to put max timer? Somehow detect if flow meters are working...
-# - Add graceful close on remote Kill command?
+# - Add expected flow rate to put max timer?
+# - Somehow detect if flow meters are working...
+# - Test MySQL connection parameters (e.g. if none provided, if -a provided and only writing)
 # - Add Evaporation calculation-only mode (to run the script to predict/inform about the upcoming the irrigation)
+# - Recover nicely if cannot connect to database (network down)
 #
 # Author E Zuidema
 #
@@ -43,12 +49,13 @@
 # can be removed upon receipt of proof of copyright for that material.
 #
 
-progname='Sprinkler.py'
-version = "2021-06-07"
+progname='irrigate.py'
+version = "2021-09-18"
 
 import sys
 import signal
 import logging
+from systemd import journal
 import argparse
 import time
 from time import sleep
@@ -62,7 +69,6 @@ import threading
 # Trying to import Raspberry Pi
 try:
   import RPi.GPIO as GPIO
-  import smbus
 except ImportError:
   # Just continue if does not work; later checking if running on RPi
   pass
@@ -72,9 +78,12 @@ import makkink_evaporation
 # See also (Dutch) https://www.knmi.nl/kennis-en-datacentrum/achtergrond/verdamping-in-nederland
 # And from page 22 of https://edepot.wur.nl/136999 it seems Makkink is indicating too much for grass by 0.88-0.92
 # Typically the evaporation seems to be too high, so correcting with a factor
-EVAP_FACTOR = 0.9
+EVAP_FACTOR = 1.0
 # How many days of evaporation to look back; should be aligned with how often to irrigate???
 EVAP_RANGE = 14
+
+# How much water maximally to irrigate per square meter
+MAX_IRRIGATION = 10
 
 # Water Source and Zone names
 source_barrel_name   = "Barrel"
@@ -86,7 +95,7 @@ zone_grass_shadow   = 0.9 # Almost all day in the sun
 zone_grass_min_flow = 0.5 # sweating / soaker hose does not need a lot of pressure / flow
 zone_front_name     = "Front (drip)"
 zone_front_area     = 12 * 4 + 8 * 4
-zone_front_shadow   = 0.9 # Almost all day in the sun
+zone_front_shadow   = 0.7 # Almost all day in the sun, but well vegetated
 zone_front_min_flow = 0.5 # dripping hose does not need a lot of pressure / flow
 zone_side_name      = "Side (sprinkler)"
 zone_side_area      = 10 * 4
@@ -94,33 +103,31 @@ zone_side_shadow    = 0.7 # Morning shadows
 zone_side_min_flow  = 5.0 # sprinklers need quite some of pressure / flow
 
 # Settings for Relay board 2 (water source ball valves)
-valve_drinking_PIN = 35
-valve_barrel_PIN = 36
+valve_drinking_PIN  = 31
+valve_barrel_PIN    = 32
 
-# Settings for I2C HATS Relay board 1 (solenoids for up to 4 irrigation areas)
-Relay_1_BUS = 1
-Relay_1_ADDR = 0x10
-Relay_1_ON = 0xFF
-Relay_1_OFF = 0x00
-valve_grass = 1
-valve_front = 2
-valve_sprinkler = 3
+# Settings for Relay board 4 (solenoids for up to 4 irrigation areas)
+valve_grass_PIN     = 35
+valve_front_PIN     = 36
+valve_sprinkler_PIN = 37
+#valve_SPARE_PIN = 38
 
 # Settings for Flow meter GPIO pins
-flow_grass_PIN     = 7  # Yellow wire
-flow_front_PIN     = 16 # Purple wire
-flow_sprinkler_PIN = 11 # Green wire
+flow_grass_PIN      = 7  # Yellow wire
+flow_front_PIN      = 11 # Green wire
+flow_sprinkler_PIN  = 15 # Purple wire
 
 def parse_arguments(logger):
   ################################################################################################################################################
   #Commandline arguments parsing
   ################################################################################################################################################    
-  parser = argparse.ArgumentParser(prog=progname, description='Sprinkler', epilog="Copyright (c) E. Zuidema")
+  parser = argparse.ArgumentParser(prog=progname, description='Automatic Irrigation script', epilog="Copyright (c) E. Zuidema")
   parser.add_argument("-l", "--log", help="Logging level, can be 'none', 'info', 'warning', 'debug', default='none'", default='none')
   parser.add_argument("-f", "--logfile", help="Logging output, can be 'stdout', or filename with path, default='stdout'", default='stdout')
-  parser.add_argument("-d", "--days", help="How many days to look back, default EVAP_RANGE (exclusive with amount)", default=EVAP_RANGE)
+  parser.add_argument("-d", "--days", help="How many days to look back, default %d (exclusive with amount)" % EVAP_RANGE, default=EVAP_RANGE)
   parser.add_argument("-a", "--amount", help="How many liters per m2 to irrigate (exclusive with days)", default = '0')
   parser.add_argument("-z", "--zones", help="Zone(s) to irrigate, can be 'grass', 'sprinkler', 'front' or multiple. Default is all", default='all', nargs='*')
+  parser.add_argument("-i", "--info", help="Do not actually irrigate, just show what it would have done", default=False, action="store_true")
   parser.add_argument("-e", "--emulate", help="Do not actually open/close valves or store data", default=False, action="store_true")
   parser.add_argument("-s", "--server", help="MySQL server or socket path, default='localhost'", default='localhost')
   parser.add_argument("-u", "--user", help="MySQL user, default='root'", default='root')
@@ -136,6 +143,8 @@ def parse_arguments(logger):
       logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(lineno)d - %(message)s')
   else:
     logging.basicConfig(filename=args.logfile,format='%(asctime)s - %(levelname)s - %(lineno)d - %(message)s')
+    # Also log to systemd
+#    logger.addHandler(journal.JournalHandler())
 
   # Setting loop duration; default 60s
   loop_seconds = 60
@@ -164,6 +173,12 @@ def parse_arguments(logger):
   else:
     emulating = False
 
+  if args.info:
+    info = True
+    emulating = True
+  else:
+    info = False
+
   zones = args.zones
   
   mysql_host=args.server
@@ -171,7 +186,7 @@ def parse_arguments(logger):
   mysql_passwd=args.password
 
   # return parsed values
-  return (loop_seconds, days, amount, zones, emulating, mysql_host, mysql_user, mysql_passwd)
+  return (loop_seconds, days, amount, zones, info, emulating, mysql_host, mysql_user, mysql_passwd)
 
 def handle_sigterm(sig, frame):
   print("SigTerm received, raising SystemExit")
@@ -304,29 +319,31 @@ def save_irrigated( logger, \
                     mysql_user, \
                     mysql_passwd ):
 
-  # Open irrigation database
-  logger.info("Opening MySQL Database irrigation on %s for writing data", mysql_host)
+  # First make sure there is some irrigation to write
+  if (watering_mm > 0.0):
+    # Open irrigation database
+    logger.info("Opening MySQL Database irrigation on %s for writing data", mysql_host)
 
-  db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='irrigation')
-  cursor = db.cursor()
+    db = mysql.connector.connect(user=mysql_user, password=mysql_passwd, host=mysql_host, database='irrigation')
+    cursor = db.cursor()
 
-  # Add irrigation amount (mm) to database
-  query = "INSERT INTO irrigated (dateTime, zone, watered) VALUES (%s, %s, %s)"
-  insert_time = time.time()
-  insert_zone = zone
-  insert_water = round(watering_mm, 1)
-  values = (insert_time, insert_zone, insert_water)
-  logger.debug("Query: %s", query)
-  logger.debug("Values: %d, %s, %f", insert_time, insert_zone, insert_water)
-  cursor.execute(query, values)
-  db.commit()
-  logger.info("Added irrigation of %0.1f mm on %s to database", watering_mm, zone)
+    # Add irrigation amount (mm) to database
+    query = "INSERT INTO irrigated (dateTime, zone, watered) VALUES (%s, %s, %s)"
+    insert_time = time.time()
+    insert_zone = zone
+    insert_water = round(watering_mm, 1)
+    values = (insert_time, insert_zone, insert_water)
+    logger.debug("Query: %s", query)
+    logger.debug("Values: %d, %s, %f", insert_time, insert_zone, insert_water)
+    cursor.execute(query, values)
+    db.commit()
+    logger.info("Added irrigation of %0.1f mm on %s to database", watering_mm, zone)
 
-  # Close irrigation database
-  if (db.is_connected()):
-    db.close()
-    cursor.close()
-    logger.info("MySQL connection is closed")
+    # Close irrigation database
+    if (db.is_connected()):
+      db.close()
+      cursor.close()
+      logger.info("MySQL connection is closed")
 
   # return
 
@@ -392,14 +409,13 @@ class WaterSource():
 
 class IrrigationZone():
   
-  def __init__(self, logger, name, relay_bus, relay_pin, area, shadow, flow_pin, flow_required = -1):
+  def __init__(self, logger, name, relay_pin, area, shadow, flow_pin, flow_required = -1):
     self.logger = logger
     self.logger.debug("IrrigationZone init for %s", name)
     self.name = name
     self.area = area
     self.shadow = shadow
     self.irrigated_liters = 0
-    self.relay_bus = relay_bus
     self.relay_pin = relay_pin
     self.flow_pin = flow_pin
     self.flow_required = flow_required
@@ -421,11 +437,11 @@ class IrrigationZone():
 
   def open_valve(self):
     self.logger.info("Setting %s zone ON", self.name)
-    self.relay_bus.write_byte_data(Relay_1_ADDR, self.relay_pin, Relay_1_ON)
+    GPIO.output(self.relay_pin, GPIO.LOW)
 
   def close_valve(self):
     self.logger.info("Setting %s zone OFF", self.name)
-    self.relay_bus.write_byte_data(Relay_1_ADDR, self.relay_pin, Relay_1_OFF)
+    GPIO.output(self.relay_pin, GPIO.HIGH)
 
   def get_flow_pin(self):
     return self.flow_pin
@@ -530,7 +546,7 @@ def main():
 
   logger = logging.getLogger(progname)
 
-  (loop_seconds, days, amount, zones_to_water, emulating, mysql_host, mysql_user, mysql_passwd) = parse_arguments(logger)
+  (loop_seconds, days, amount, zones_to_water, info, emulating, mysql_host, mysql_user, mysql_passwd) = parse_arguments(logger)
   logger.info("Started program %s, version %s", progname, version)
 
   if (days == 0):
@@ -548,8 +564,6 @@ def main():
   if (emulating or "raspberrypi" not in host_name):
     logger.info("Running on %s, emulating RPi behaviour", host_name)
     emulating = True
-    # Define bus variable to prevent errors
-    bus = 0
   else:
     logger.info("Running on %s, running real RPi GPIO", host_name)
     emulating = False
@@ -561,8 +575,11 @@ def main():
     GPIO.setup(valve_barrel_PIN,   GPIO.OUT, initial=GPIO.LOW)
     GPIO.setup(valve_drinking_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-    # Settings for Relay board 1 (solenoids for up to 4 irrigation areas)
-    bus = smbus.SMBus(Relay_1_BUS)
+    # Settings for Relay board 4, LOW active (solenoids for up to 4 irrigation areas)
+    GPIO.setup(valve_grass_PIN,   GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(valve_front_PIN, GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(valve_sprinkler_PIN, GPIO.OUT, initial=GPIO.HIGH)
+#    GPIO.setup(valve_SPARE_PIN, GPIO.OUT, initial=GPIO.HIGH)
 
     # Settings for flow meters
     GPIO.setup(flow_grass_PIN,     GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -596,21 +613,24 @@ def main():
       exit(0)
 
   # Possibly need to irrigate (depending on past irrigations), set up sources & zones
-  # Init sources, start with most durable one (will start with source 0), until empty (no flow)
-  sources = []
-  sources.append(WaterSource(logger, source_barrel_name, valve_barrel_PIN))
-  sources.append(WaterSource(logger, source_drinking_name, valve_drinking_PIN))
 
   # Init zones
   zones = []
-  zones.append(IrrigationZone(logger, zone_grass_name, bus, valve_grass,     zone_grass_area, zone_grass_shadow, flow_grass_PIN,     zone_grass_min_flow))
-  zones.append(IrrigationZone(logger, zone_front_name, bus, valve_front,     zone_front_area, zone_front_shadow, flow_front_PIN,     zone_front_min_flow))
-  zones.append(IrrigationZone(logger, zone_side_name,  bus, valve_sprinkler, zone_side_area,  zone_side_shadow,  flow_sprinkler_PIN, zone_side_min_flow ))
+  zones.append(IrrigationZone(logger, zone_grass_name, valve_grass_PIN,     zone_grass_area, zone_grass_shadow, flow_grass_PIN,     zone_grass_min_flow))
+  zones.append(IrrigationZone(logger, zone_front_name, valve_front_PIN,     zone_front_area, zone_front_shadow, flow_front_PIN,     zone_front_min_flow))
+  zones.append(IrrigationZone(logger, zone_side_name,  valve_sprinkler_PIN, zone_side_area,  zone_side_shadow,  flow_sprinkler_PIN, zone_side_min_flow ))
 
-  # Start irrigation
-  # start with first water source (most durable)
-  source_index = 0
-  source = sources[source_index]
+  # Skip if no need to water
+  if (not info):
+    # Init sources, start with most durable one (will start with source 0), until empty (no flow)
+    sources = []
+    sources.append(WaterSource(logger, source_barrel_name, valve_barrel_PIN))
+    sources.append(WaterSource(logger, source_drinking_name, valve_drinking_PIN))
+
+    # Start irrigation
+    # start with first water source (most durable)
+    source_index = 0
+    source = sources[source_index]
   
   for zone in zones:
     if (zones_to_water != "all"):
@@ -627,23 +647,34 @@ def main():
     if (days > 0):
       waterDay = load_irrigated(logger, zone.get_name(), days, mysql_host, mysql_user, mysql_passwd)
       waterSum = numpy.sum(waterDay)
-      logger.info("Watering %.1f mm in last %d days", waterSum, days)
+      logger.info("Zone %s Watering %.1f mm in last %d days", zone.get_name(), waterSum, days)
       # Now calculate shortage = evaporation - rain - watering
       net_evap = evapSum * zone.get_shadow() - rainSum - waterSum
       print("Zone %s Net Evaporation = %.1f mm in last %d days" % (zone.get_name(), net_evap, days))
+      logger.info("Zone %s Net Evaporation = %.1f mm in last %d days" % (zone.get_name(), net_evap, days))
 
       if net_evap <= 1:
         print("No need for irrigation")
+        logger.info("No need for irrigation")
         continue # next zone in zones
       else:
-        liters_per_m2 = net_evap
+        if (net_evap > MAX_IRRIGATION):
+          liters_per_m2 = MAX_IRRIGATION
+        else:
+          liters_per_m2 = net_evap
     else:
       liters_per_m2 = amount
 
     # Translate to liters for this zone
     liters = zone.get_area() * liters_per_m2
+    if (info):
+      print("Should irrigate zone %s with %.0f liters on the %d m2 area" % (zone.get_name(), net_evap * zone.get_area(), zone.get_area()))
+      continue # to next zones in zone
+        
     print("Starting irrigating zone %s with source %s" % (zone.get_name(), source.get_name()))
     print("Need to put %.0f liters on the %d m2 area" % (liters, zone.get_area()))
+    logger.info("Starting irrigating zone %s with source %s" % (zone.get_name(), source.get_name()))
+    logger.info("Need to put %.0f liters on the %d m2 area" % (liters, zone.get_area()))
 
     if (not emulating):
       # Init flowmeter callback
@@ -663,6 +694,7 @@ def main():
     # Wait for some flow to start, get current timestamp and first flow meter reading, while handling terminations
     try:
       sleep(10)
+    # Also allow Keyboard interrupts for command line testing
     except (KeyboardInterrupt, SystemExit):
       # Close the valves and exit program
       logger.info("Interrupted; closing valves and exiting...")
@@ -707,6 +739,10 @@ def main():
         else:
           # Remove fake flowmeter thread callback
           zone.clear_emulated_pulse_callback()
+        print("ERROR: Ended zone %s due to Interruption" % zone.get_name())
+        if (actual_liters < liters):
+          print("Having only watered %.1f liters of required %.1f" % (actual_liters, liters))
+        logger.info("Ended zone %s having watered %.1f mm (%.1f liters)" % (zone.get_name(), actual_liters_per_m2, actual_liters))
         exit(-1)
       # Check flow and time
       current_time = datetime.now()
@@ -739,9 +775,17 @@ def main():
           else:
             # Remove fake flowmeter thread callback
             zone.clear_emulated_pulse_callback()
+          print("ERROR: Ended zone %s due to No More Sources (Is there a water flow issue?)" % zone.get_name())
+          if (actual_liters < liters):
+            print("Having only watered %.1f liters of required %.1f" % (actual_liters, liters))
+          logger.info("Ended zone %s having watered %.1f mm (%.1f liters)" % (zone.get_name(), actual_liters_per_m2, actual_liters))
           exit(-1)
         # Continue with next source
         source = sources[source_index]
+        print("Continuing irrigating zone %s with source %s" % (zone.get_name(), source.get_name()))
+        print("Need to put %.0f liters on the %d m2 area" % (liters-actual_liters, zone.get_area()))
+        logger.info("Continuing irrigating zone %s with source %s" % (zone.get_name(), source.get_name()))
+        logger.info("Need to put %.0f liters on the %d m2 area" % (liters-actual_liters, zone.get_area()))
         if (not emulating):
           # Open source valve
           source.open_valve()
@@ -802,6 +846,7 @@ def main():
       save_irrigated(logger, zone.get_name(), float(actual_liters_per_m2), mysql_host, mysql_user, mysql_passwd)
 
     print("Ended zone %s having watered %.1f mm (%.1f liters)" % (zone.get_name(), actual_liters_per_m2, actual_liters))
+    logger.info("Ended zone %s having watered %.1f mm (%.1f liters)" % (zone.get_name(), actual_liters_per_m2, actual_liters))
 
   # Done iterating over all zones
   actual_liters = 0
@@ -810,12 +855,14 @@ def main():
     actual_liters += zone.get_irrigated_liters()
     actual_liters_per_m2 += zone.get_irrigated_liters() / zone.get_area()
   print("Ended irrigation having watered %.1f liters" % actual_liters)
+  logger.info("Ended irrigation having watered %.1f liters" % actual_liters)
 
   if (not emulating):
     # Clean GPIO settings
     GPIO.cleanup()
-  
+
   print("%s %s Done." % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), progname))
+  logger.info("%s %s Done." % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), progname))
 
 if __name__ == '__main__':
    main()
