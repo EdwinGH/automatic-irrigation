@@ -25,6 +25,7 @@
 # Release 2021-08-07 Added file logging also going to systemd log (journal), added better messages when no water sources
 # Release 2021-09-12 Replaced relay board, re-distributed PINs
 # Release 2021-09-18 Added MAX_IRRIGATION to limit daily amount of water
+# Release 2022-03-13 Adapted EVAP_RANGE (how far looking back) to 21 days from winter/spring logging
 #
 # TODO
 # - Issue with flow vs pressure: Sprinklers generate flow of only ~2, but pressure is good...
@@ -50,7 +51,7 @@
 #
 
 progname='irrigate.py'
-version = "2021-09-18"
+version = "2022-03-13"
 
 import sys
 import signal
@@ -80,7 +81,7 @@ import makkink_evaporation
 # Typically the evaporation seems to be too high, so correcting with a factor
 EVAP_FACTOR = 1.0
 # How many days of evaporation to look back; should be aligned with how often to irrigate???
-EVAP_RANGE = 14
+EVAP_RANGE = 21
 
 # How much water maximally to irrigate per square meter
 MAX_IRRIGATION = 10
@@ -665,10 +666,13 @@ def main():
     else:
       liters_per_m2 = amount
 
-    # Translate to liters for this zone
-    liters = zone.get_area() * liters_per_m2
-    if (info):
-      print("Should irrigate zone %s with %.0f liters on the %d m2 area" % (zone.get_name(), net_evap * zone.get_area(), zone.get_area()))
+    if (not info):
+      # Translate to liters for this zone
+      liters = zone.get_area() * liters_per_m2
+    else:
+      liters = zone.get_area() * net_evap
+      print("Should irrigate zone %s with %.0f liters on the %d m2 area" % (zone.get_name(), liters, zone.get_area()))
+      zone.set_irrigated_liters(liters)
       continue # to next zones in zone
         
     print("Starting irrigating zone %s with source %s" % (zone.get_name(), source.get_name()))
@@ -854,8 +858,13 @@ def main():
   for zone in zones:
     actual_liters += zone.get_irrigated_liters()
     actual_liters_per_m2 += zone.get_irrigated_liters() / zone.get_area()
-  print("Ended irrigation having watered %.1f liters" % actual_liters)
-  logger.info("Ended irrigation having watered %.1f liters" % actual_liters)
+  if (not info):
+    print("Ended irrigation having watered %.0f liters" % actual_liters)
+    logger.info("Ended irrigation having watered %.0f liters" % actual_liters)
+  else:
+    print("In total should water %.0f liters" % actual_liters)
+    logger.info("In total should water %.0f liters" % actual_liters)
+  
 
   if (not emulating):
     # Clean GPIO settings
