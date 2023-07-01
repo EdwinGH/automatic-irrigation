@@ -16,6 +16,12 @@ Still in beta phase; all parts functional, but needs to be finetuned.
 ## Electronic circuit used
 See https://github.com/EdwinGH/automatic-irrigation/blob/main/circuit.png
 
+## Dependencies
+The following packages are needed:
+* python3-mysql.connector
+* python3-numpy
+Also for mailing the results (see the crontab) the msmtp package was installed
+
 ## How to run
 Crontab on Raspberry Pi to start and monitor the process:
 
